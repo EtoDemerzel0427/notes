@@ -57,10 +57,16 @@ jobs:
             cp notes/content/_config.json wiki/content/
           fi
 
+      - name: Fix CSP
+        run: |
+          # Add blob: to script-src in CSP
+          sed -i "s/script-src 'self' 'unsafe-inline' 'unsafe-eval'/script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:/" wiki/index.html
+
       - name: Build Site
         run: |
           cd wiki
-          npm run build
+          # Set base path to /notes/ for subdirectory hosting
+          npm run build -- --base=/notes/
 
       - name: Upload Artifact
         uses: actions/upload-pages-artifact@v3
