@@ -1,6 +1,6 @@
 ---
 title: 量子力学笔记：薛定谔方程
-slug: 
+slug: schrodinger
 date: 2023-11-15
 tags: [Math, Quantum]
 category: Physics

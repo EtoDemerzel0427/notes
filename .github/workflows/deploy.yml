@@ -28,7 +28,7 @@ jobs:
         with:
           repository: EtoDemerzel0427/wiki
           path: wiki
-          ref: v0.3.1 # Use the latest stable release
+          ref: v0.3.1 # Use the latest stable release with CSP fixes
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -56,11 +56,6 @@ jobs:
           if [ -f notes/content/_config.json ]; then
             cp notes/content/_config.json wiki/content/
           fi
-
-      - name: Fix CSP
-        run: |
-          # Add blob: to script-src in CSP
-          sed -i "s/script-src 'self' 'unsafe-inline' 'unsafe-eval'/script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:/" wiki/index.html
 
       - name: Build Site
         run: |

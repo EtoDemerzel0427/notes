@@ -1,9 +1,9 @@
 ---
-title: 
-slug: 
+title: C++ auto
+slug: cpp-auto
 date: 2025-11-29
-tags: []
-category: 
+tags: [C++]
+category: Dev
 ---
 
 # C++ auto
