@@ -26,9 +26,9 @@ jobs:
       - name: Checkout Wiki Engine
         uses: actions/checkout@v4
         with:
-          repository: EtoDemerzel0427/wiki
+          repository: EtoDemerzel0427/RectoWiki
           path: wiki
-          ref: v0.3.1 # Use the latest stable release with CSP fixes
+          ref: main # Use the latest commit from main
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -60,8 +60,10 @@ jobs:
       - name: Build Site
         run: |
           cd wiki
-          # Set base path to /notes/ for subdirectory hosting
-          npm run build -- --base=/notes/
+          # Get repo name (e.g., "EtoDemerzel0427/notes" -> "notes")
+          REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+          echo "Building for base path: /$REPO_NAME/"
+          npm run build -- --base=/$REPO_NAME/
 
       - name: Upload Artifact
         uses: actions/upload-pages-artifact@v3
