@@ -4,6 +4,7 @@ slug: constexpr
 date: 2025-11-28
 tags: [C++]
 category: Dev
+draft: false
 ---
 
 `constexpr`是C++11 引入的关键字，并在之后的每个版本中都得到了进一步的加强。
