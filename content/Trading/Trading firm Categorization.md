@@ -4,6 +4,7 @@ slug: trading-firm-categorization
 date: 2025-12-19
 tags: [quant]
 category: Trading
+draft: false
 ---
 
 互联网上提到trading firm的时候，人们常常提到一些名词：
@@ -14,6 +15,8 @@ market maker、hedge fund、prop shop、sell side、buy side、HFT，etc。这�
 
 * 资金来源：界定机构管理资金的法律属性与责任边界。
 * 收益模式：界定机构在市场微观结构中的角色与风险承担方式。
+* 市场生态角色：界定机构在市场生态中所处的位置，以及其服务对象。
+* 时间尺度：机构在交易决策、报价更新和风险调整中所采用的典型时间尺度。
 
 ## 二、第一维度：资金来源（Capital Structure）
 
