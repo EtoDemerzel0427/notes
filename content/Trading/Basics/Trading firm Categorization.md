@@ -2,7 +2,7 @@
 title: Trading firm Categorization
 slug: trading-firm-categorization
 date: 2025-12-19
-tags: [quant]
+tags: [quant, concept]
 category: Trading
 draft: false
 ---
@@ -172,3 +172,4 @@ Sell side / Buy side 描述的是你在金融生态中的位置和功能，
 | Renaissance        | 客户   | Quant Alpha         | Buy Side  | 高–中  |
 | Bridgewater        | 客户   | Macro / Directional | Buy Side  | 低    |
 
+> Note: 出于概念介绍的目的，关于Buy/Sell side的区分在这里过于简化了，事实上表中的很多机构会从事更复杂的市场操作，所以常常是buy sell都有涉猎。

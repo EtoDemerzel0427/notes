@@ -2,13 +2,10 @@
 title: “Long/Short”到底是什么？
 slug: long-short
 date: 2025-12-18
-tags: []
+tags: [quant, concept]
 category: Trading
 draft: false
 ---
-
-
-
 
 ## 零、历史渊源
 
