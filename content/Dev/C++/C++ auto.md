@@ -4,7 +4,7 @@ slug: cpp-auto
 date: 2025-11-29
 tags: [C++]
 category: Dev
-draft: false
+draft: true
 ---
 
 # C++ auto
