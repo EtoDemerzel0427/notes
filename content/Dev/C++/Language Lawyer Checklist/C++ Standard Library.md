@@ -2,7 +2,7 @@
 title: C++ Standard Library
 slug: cpp-standard-library
 date: 2026-01-10
-tags: [C++]
+tags: [C++, Overview]
 category: Dev
 draft: false
 ---

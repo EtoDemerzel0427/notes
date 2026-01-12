@@ -2,7 +2,7 @@
 title: C++ Core Language
 slug: cpp-core-language
 date: 2026-01-10
-tags: [C++]
+tags: [C++, Overview]
 category: Dev
 draft: false
 ---
