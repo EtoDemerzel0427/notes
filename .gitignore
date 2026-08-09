@@ -6,3 +6,6 @@
 Icon?
 content.json
 _draft_meta.json
+
+# RectoWiki local-only drafts and metadata
+.rectowiki/
