@@ -49,8 +49,8 @@ draft: false
 | 5 | **参数类型**范围？ | 只有算术类型/enum/短字符串 → 可以 `memcpy` 编码。任意对象 → 需要用户提供序列化，或退化成热路径格式化 | 算术、enum、string-like |
 | 6 | **字符串参数的生命周期**？ | 消费者线程稍后才读 → 存指针是悬垂引用。必须按值拷贝；字面量可以只存指针（可提供显式 `LOG_REF` 语义） | 按值拷贝 |
 | 7 | **线程模型**：热路径线程数固定吗？会动态创建/退出吗？ | 固定且少 → per-thread SPSC 最合适。大量短命线程 → 每线程 1MiB ring 不划算，要考虑 MPSC 或线程池化 ring | 少量、长寿命、pin 核 |
-| 8 | **输出目标**？文件、stdout、网络、共享内存？一条日志多个 sink？ | 决定 sink 抽象；共享内存意味着消费者可以是**另一个进程**（崩溃也不丢） | 文件为主，可多 sink |
-| 9 | **Level 控制**：编译期还是运行期？ | 编译期：Release 里 TRACE/DEBUG 连参数求值都不存在。运行期：线上临时开 DEBUG | 两层都要 |
+| 8 | **输出目标**？文件、stdout、网络、共享内存？一条日志多个 sink？**由谁决定**——代码写死还是配置文件？ | 决定 sink 抽象；共享内存意味着消费者可以是**另一个进程**（崩溃也不丢）。由配置决定 → 需要 sink 工厂 + 启动时按 config 装配，代码里不出现具体 sink | 文件为主，可多 sink；**来自 config** |
+| 9 | **Level 由谁控制**？和 build type（Debug/Release）绑定，还是运行期配置？能不能不重启改？ | Level 是**运维参数**，不是编译参数：同一个 Release 二进制，回放/排障时开 DEBUG，平时 INFO。所以是 config 里的一项，热路径上一次 atomic relaxed load。编译期硬砍（`MLOG_MIN_LEVEL` 那种）是可选的额外优化，**不能作为唯一控制手段** | 运行期，**来自 config**，支持热更新 |
 | 10 | **崩溃时**的要求？ | 最后几百条日志恰恰是最有价值的。决定要不要 crash handler / mmap 文件做 ring | 希望尽量保住 |
 | 11 | **吞吐量与 burst**特征？ | 期权做市的典型 burst：underlying 一个 tick → 几千个 option 重新定价/报价 → 瞬间几千条日志。决定 ring 大小 | 平均低、burst 高 |
 | 12 | 平台？ | Linux x86-64 → 可以假设 TSO、invariant TSC、vDSO、64B cache line | Linux x86-64 |
@@ -62,7 +62,7 @@ draft: false
 * 生产者跑赢消费者时：丢弃 + 计数，绝不阻塞交易线程
 * 线程内严格有序；跨线程按时间戳 k-way merge，尽力有序
 * 参数限定为算术类型、enum、string-like（按值拷贝）
-* Level 双层控制：编译期宏裁剪 + 运行期 atomic 阈值
+* Level 与 sink 列表来自 config，与 build type 无关；level 可热更新（atomic），sink 列表启动后只读
 ```
 
 ### 为什么做市场景对 logging 特别敏感
@@ -243,9 +243,9 @@ void formatRecord(std::string& out, const char* fmt, const std::byte* p) {
 
 - 每个 lambda 表达式是**独一无二的闭包类型** → 里面的 `static` 天然 per-callsite。
 - 参数是 `auto` → 能用 `decltype` 拿到实参类型去实例化 `formatRecord<Ts...>`。
-- 为什么必须是宏：需要 `__FILE__`/`__LINE__`（C++20 的 `std::source_location` 可替代这一点），更重要的是需要**参数惰性求值**——level 被过滤时，`__VA_ARGS__` 里的表达式根本不执行。函数做不到这一点。
+- 为什么必须是宏：需要 `__FILE__`/`__LINE__`（C++20 的 `std::source_location` 可替代这一点），更重要的是需要**参数惰性求值**——level 被过滤时，`__VA_ARGS__` 里的表达式根本不执行。函数做不到这一点。注意这个价值**和编译期裁剪无关**：level 是运行期 config，`if (enabled(lvl))` 为假时宏同样跳过了参数求值；`MLOG_MIN_LEVEL` 那一层只是可选的额外优化。
 - `do { } while (0)`：让宏在 `if (x) LOG(...); else ...` 里表现得像一条语句。
-- ⚠️ 推论：**永远不要在 log 参数里写副作用**（`LOG_DEBUG("{}", ++counter)`），Release 里它会消失。
+- ⚠️ 推论：**永远不要在 log 参数里写副作用**（`LOG_DEBUG("{}", ++counter)`）——config 把 DEBUG 关掉时它就不执行了。
 
 ### 4.4 C++20/23 了，还必须用宏吗？
 
@@ -255,7 +255,8 @@ void formatRecord(std::string& out, const char* fmt, const std::byte* p) {
 | --- | --- | --- |
 | 拿 `__FILE__` / `__LINE__` | C++20 `std::source_location::current()` 作为默认实参 | ✅ 能（和变参模板一起用需要下面的技巧） |
 | 变参 | 变参模板 `template <class... Ts>` | ✅ 早就不需要宏了（C++11） |
-| 编译期 level 裁剪 | level 作为模板参数 + `if constexpr` | ⚠️ 函数体能裁掉，**参数求值裁不掉** |
+| 跳过被 config 关掉的 level 的**参数求值** | 没有：函数调用语义决定实参先求值 | ❌ 运行期 `if (enabled())` 只能跳过函数体 |
+| （可选）编译期 level 裁剪 | level 作为模板参数 + `if constexpr` | ⚠️ 函数体能裁掉，参数求值同样裁不掉 |
 | per-callsite `static` 元数据 | lambda 作为默认模板实参：`template <auto Tag = []{}>` | ⚠️ 能，但属于"聪明过头"的技巧 |
 | （附赠）编译期校验 `{}` 个数 | `consteval` 构造函数——`std::format` 就是这么做的 | ✅ 而且比宏做得更好 |
 
@@ -332,6 +333,7 @@ expensive() evaluated!                             ← log<Level::Debug>("dbg {}
 | **按 level 分级** | 视级别 | ERROR 不丢、DEBUG 可丢 | 中 | 可以叠加在上面任一策略上 |
 | **采样 / 限流** | ✅ | 主动丢 | 中 | 同一 callsite 每秒 >N 条时只留 1/k |
 | **双通道** | 关键通道可阻塞 | 关键日志不丢 | 中 | 关键审计走独立的"不丢"队列，普通日志走 drop 队列 |
+| **Grow**（满了就分配新段） | 稳态恒定；偶发一次 `malloc` | ✅ 不丢（直到内存上限） | 中 | quill 的默认 `UnboundedBlocking`；通用服务够用，做市热路径通常不接受偶发的 `malloc` |
 
 ### 为什么选 drop newest + count
 
@@ -486,6 +488,25 @@ Reference solution 的 `SpscRing` 在此基础上变成**字节 ring + 两阶段
 - **Sink 只在消费者线程上被调用 → 内部不需要任何锁**。这也回答了"两个线程同时写 sink 怎么保证顺序"——它们不会同时写，顺序由消费者的 merge 决定。
 - `FileSink` 攒 32KB 再 `write`，把 syscall 批量化；每 100ms 或关闭时 `flush`。flush 周期 = 崩溃时最多丢多少已格式化的日志，是一个显式的取舍。
 
+**Level 与 sink 由 config 装配，不写死在代码里**：
+
+```yaml
+logging:
+  level: info                 # 全局阈值；可按 logger/模块细分
+  sinks:
+    - type: file
+      path: /var/log/mm/quoter.log
+      level: debug            # per-sink 阈值
+      flush_interval_ms: 100
+    - type: console
+      level: warn
+```
+
+- 启动时：读 config → `setLevel()` → 用一个 `type → 构造函数` 的注册表逐个 `addSink()` → `start()`。业务代码只看到 `LOG_INFO(...)`，不知道也不该知道输出去了哪里。
+- **同一个二进制**在回放、排障、生产之间切换只改 config；这也是为什么 level 不能绑在 Debug/Release 上。
+- **热更新**：level 是一个 `atomic<Level>`，收到 SIGHUP 或文件变更后直接 `store`，热路径零成本感知。sink 列表变更（换文件、加网络 sink）走 COW 快照替换（见 [[Thread Synchronization Patterns in C++]] §6），或者更简单地约定"sink 列表只能在重启时变"。
+- 全局一个 level 通常不够：真实系统按 logger 名字（`md.feed`、`quoter.spx`）分级，每个 logger 一个 atomic 阈值，callsite 持有 logger 指针。quill 的 `Logger` 对象就是这么组织的。
+
 ### 7.4 空转策略
 
 | 策略 | 延迟 | 代价 |
@@ -497,6 +518,22 @@ Reference solution 的 `SpscRing` 在此基础上变成**字节 ring + 两阶段
 消费者慢一点没关系（ring 会吸收），但**绝不能让生产者为唤醒消费者付费**。
 
 消费者线程应 pin 在与交易线程**同一 NUMA node** 的另一个核上：同 node 保证 ring 的内存访问是本地的，不同核保证不抢交易线程的时间片。
+
+#### 市面上的库是怎么做的
+
+| 库 | 前端队列 | 后台线程空转时 | 生产者是否付唤醒成本 |
+| --- | --- | --- | --- |
+| **quill**（v4+） | 每线程一个 SPSC ring；`FrontendOptions::queue_type` 可选 `UnboundedBlocking`（默认，满了就再分配一段）/ `UnboundedDropping` / `BoundedBlocking` / `BoundedDropping` | 轮询所有 ring；一轮没活时 `sleep_for(BackendOptions::sleep_duration)`，默认 **500ns**；设为 0 就是纯 busy-spin；`enable_yield_when_idle` 改成 `yield()`；`cpu_affinity` 可以 pin 核 | **否**。后台线程从不睡在 condvar 上，前端只做 ring 写入 |
+| **NanoLog**（Stanford） | 每线程一个 staging buffer | 压缩线程轮询；空转时短暂 sleep（µs 级，配置项） | 否 |
+| **spdlog async** | **一个** MPMC 阻塞队列（`mpmc_blocking_q`：mutex + 两个 condvar，即本文 Stage 1）；溢出策略 `block` / `overrun_oldest` / `discard_new` | 线程池 `dequeue_for` 在 condvar 上等 | **是**：每次 enqueue 都 `notify_one`，有等待者时是一次 futex wake |
+| **binlog**（Morgan Stanley） | 每线程队列 | 没有后台线程：由用户自己的线程定期 `consume`，控制权完全交给应用 | 否 |
+
+几点值得对照着讲：
+
+- quill 的默认 500ns 是一个刻意的折中：延迟上界只有半微秒，但一轮空转让出 CPU，不至于把核烧满；关键系统会把它调成 0 并 pin 核。这就是上面表格里 busy-spin 和 `sleep_for` 之间的那个"调节旋钮"，**做成配置项**而不是写死。
+- quill 的默认队列是 *unbounded blocking*：满了不丢也不阻塞，而是分配新的一段 ring（上限 `unbounded_queue_max_capacity`，默认 GiB 级）。这是第四种 backpressure 策略——**增长**：延迟代价是一次 `malloc`（偶发，不在稳态路径上），换来"正常情况下永不丢"。做市热路径通常会显式选 `BoundedDropping`，因为一次意外的 `malloc` 也可能是几十 µs。
+- quill 有 `log_timestamp_ordering_grace_period`（默认 µs 级）——就是 §7.1 说的 **watermark**：后台线程只处理时间戳早于 `now − grace` 的记录，给还没 commit 的慢生产者留出时间。
+- spdlog 的 async 模式恰好是本文 Stage 1 的形态。它足够好用，但不是低延迟 logger：一把锁、条件变量、每条日志一次 `notify`。面试里可以直接拿它做对比："spdlog async 的问题就是 §3 那张表"。
 
 ---
 
@@ -527,11 +564,53 @@ SpscRing& localRing() {
 | --- | --- | --- |
 | `system_clock::now()` / `clock_gettime(CLOCK_REALTIME)` | ~20ns（Linux vDSO，不进内核） | 会被 NTP 调整，可能回跳；对 merge 排序不友好 |
 | `CLOCK_MONOTONIC` | ~20ns | 单调，但和 wall clock 的映射需要另存 |
+| `CLOCK_REALTIME_COARSE` / `MONOTONIC_COARSE` | ~5ns | 分辨率只有一个 tick（1–4ms），日志时间戳不可用 |
 | `rdtsc` / `rdtscp` | ~5–10ns | 需要 invariant TSC（`constant_tsc nonstop_tsc`）；多 socket 之间可能有 offset；需要后台周期性校准 `(tsc, wall)` 对，消费者线程做线性换算 |
+| 任何走真 syscall 的时钟 | 200ns – 1µs+ | clocksource 不是 tsc（HPET、某些 VM）时 vDSO 会退化成 syscall，见下 |
 
-**vDSO**：内核把 `clock_gettime` 的实现映射到用户态地址空间，读一块内核维护的共享内存（用 seqlock 保护）+ 一次 `rdtsc`，全程没有特权级切换。
+### 9.1 为什么这些方法速度差这么多
 
-面试里的说法：先用 `system_clock`（简单、正确、20ns 在预算内），然后主动说"如果要再抠 15ns，换成 `rdtsc`，代价是 XXX"。
+从硬件往上看，**所有高分辨率时间最终都来自同一个源：CPU 的 TSC 计数器**（Time Stamp Counter，每个核一个 64 位寄存器，以固定频率递增）。差别在于"从 TSC 到你拿到的那个数"中间经过了几层。
+
+**第 0 层：`rdtsc`**——一条指令，直接把计数器读进 `edx:eax`，约 20 个 cycle。拿到的是一个**无量纲的 tick 数**：不知道它对应哪一秒，甚至不知道频率是多少（需要从 `cpuid 0x15`、内核 `/proc/cpuinfo` 或自己校准得到）。它便宜正是因为它**什么都不承诺**。
+
+```text
+时间 = base_wall + (tsc − base_tsc) × mult >> shift
+```
+
+**第 1 层：vDSO 版 `clock_gettime`**——内核帮你做上面这个换算。内核每个 tick（timekeeping 更新时）把 `(base_tsc, base_wall, mult, shift)` 写进一块映射到每个进程地址空间的只读页（vvar page）。用户态调用 `clock_gettime` 时，实际执行的是映射进来的内核代码：
+
+1. 读 seqlock 序号（内核正在更新那组参数时要重试——这就是 [[Thread Synchronization Patterns in C++]] §5 的 seqlock，用在内核和用户态之间）；
+2. `rdtsc`；
+3. 乘、移位、加 base；处理纳秒进位到秒；
+4. 再读一次序号校验；
+5. 函数调用本身：经过 PLT、libc 的 wrapper、按 clock id 分发。
+
+所以它 = rdtsc + 十几条算术指令 + 两次内存读 + 一次函数调用 ≈ 20–25ns。**多出来的 15ns 买的是"这是一个有单位、和墙上时钟对齐、NTP 修正过的值"**。
+
+**`CLOCK_REALTIME` vs `CLOCK_MONOTONIC`** 在这一层成本一样，只是 `base_wall` 不同：前者会被 NTP 跳变（`settimeofday`），后者只被平滑调速（slew），单调不回退。`std::chrono::system_clock` = `CLOCK_REALTIME`，`steady_clock` = `CLOCK_MONOTONIC`。
+
+**`*_COARSE`**：跳过 `rdtsc` 和换算，直接返回内核上一个 tick 时写下的 `base_wall`。只剩几次内存读，~5ns，但分辨率是 tick 周期。
+
+**第 2 层：真正的 syscall**——什么时候会掉到这里：
+
+- 内核选的 clocksource 不是 `tsc`（`cat /sys/devices/system/clocksource/clocksource0/current_clocksource`），比如老机器/某些虚拟机上是 `hpet` 或 `acpi_pm`——读这些设备必须进内核做 MMIO；
+- TSC 被判定不稳定（跨 socket 不同步、频率随 P-state 变化、休眠后停止），内核就不敢在用户态用它；
+- 某些 clock id（老内核的 `CLOCK_MONOTONIC_RAW`、`CLOCK_BOOTTIME`）没有 vDSO 实现。
+
+一次 syscall 的固定开销：特权级切换、寄存器保存、（Spectre/Meltdown 缓解开启时）页表切换和 flush，加起来 200ns 起步，在 VM 里可以到 µs。**这就是为什么低延迟系统上要先确认 clocksource 是 tsc，否则"20ns 的 `now()`"会悄悄变成 500ns。**
+
+**`rdtscp` 与序列化**：`rdtsc` 是乱序执行的——CPU 可能在之前的指令完成前就读计数器。给日志打时间戳无所谓（误差几十 cycle）；做 benchmark 时要 `lfence; rdtsc` 或用 `rdtscp`（它等待之前的 load 完成，并顺带返回核编号，可用来检测跨核迁移）。代价是多几个 cycle 的流水线排空。
+
+**所以低延迟 logger 的做法**（quill 默认 `ClockSourceType::Tsc` 就是这么做的）：热路径只存裸 `rdtsc` 值；后台线程每隔一段时间（quill 的 `rdtsc_resync_interval`，默认几百 ms）采一对 `(rdtsc, clock_gettime)` 做校准，格式化时再把 tick 换算成墙上时间。相当于**把 vDSO 做的那次换算从热路径挪到冷路径**——和整篇笔记"把工作从热路径挪走"的思路完全一致。要付的代价是三个坑：
+
+1. **invariant TSC**：老 CPU 的 TSC 会随频率调节变化，或在 C-state 里停摆。看 `/proc/cpuinfo` 里的 `constant_tsc nonstop_tsc`（Nehalem 之后基本都有）。
+2. **跨 socket 偏移**：多路机器上各 socket 的 TSC 起点可能不同，内核会尝试同步，但不保证。线程 pin 核可以回避；不 pin 就要按核校准。
+3. **校准漂移**：TSC 频率与墙钟之间有 ppm 级误差，校准间隔越长、换算出的墙钟越偏。做市系统要求的是**线程间、进程间时间戳可比**（和交易所时间戳对齐），所以校准要够勤，或者直接用 PTP 校过的系统时钟。
+
+顺带一提 ARM：对应的寄存器是 `cntvct_el0`，频率从 `cntfrq_el0` 读，天生跨核一致。但 Apple Silicon 上它只有 24MHz——**一个 tick 是 41ns**，比 x86 的 TSC 粗两个数量级。（本文 demo 在 Mac 上跑出的时间戳尾数全是 `000`，则是另一回事：libc++ 的 `system_clock` 在 Darwin 上走 `gettimeofday`，只有微秒精度。）
+
+面试里的说法：先用 `system_clock`（简单、正确、20ns 在预算内），然后主动说"如果要再抠 15ns，换成 `rdtsc`，代价是要自己做校准并处理 TSC 的三个坑"。
 
 ---
 
@@ -634,7 +713,7 @@ Ring 是 `std::byte[]`，记录落在任意偏移上。`*reinterpret_cast<Record
 1. 第一反应是不是"热路径不格式化、不分配、不加锁"——**分水岭**。
 2. 能不能**自己提出**丢日志策略和有序性问题，而不是等着被问。
 3. 队列选型有没有理由：为什么 SPSC-per-thread 而不是一把 mutex 或一个 MPMC；`memory_order` 用得对不对、讲不讲得出为什么。
-4. 接口设计：宏 vs 模板、编译期裁剪、sink 抽象是否干净。
+4. 接口设计：宏 vs 模板、level 和 sink 是否配置驱动、sink 抽象是否干净。
 5. 深挖题：`string_view` 参数怎么办？两个线程同时写 sink 怎么保证顺序？消费者落后怎么办？`rdtsc` 有什么坑？
 6. 工程意识：dropped 计数、崩溃 flush、可观测性、怎么测。
 
@@ -672,6 +751,7 @@ Ring 是 `std::byte[]`，记录落在任意偏移上。`*reinterpret_cast<Record
 - [ ] 先写 mutex + condvar 版本，列出残留的 5 项开销
 - [ ] 静态 `SourceMeta` + 参数 `memcpy`；解释类型信息怎么通过函数指针恢复
 - [ ] 明确说出 backpressure 选择及理由；**丢了要计数**
+- [ ] 说清 level 和 sink 来自 config、与 build type 无关；level 热更新走 atomic
 - [ ] 写 `SpscQueue<T>`；逐个解释 memory order、`alignas`、index cache
 - [ ] 消费者：merge 的局限、`to_chars`、批量 write、不让生产者付唤醒成本
 - [ ] 收尾：主动列出未完成项

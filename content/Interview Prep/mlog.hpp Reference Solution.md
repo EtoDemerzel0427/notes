@@ -72,6 +72,9 @@ callsite --(memcpy)--> per-thread SPSC ring --(consumer thread)--> format --> si
 10. 每个线程首条日志会触发 1MiB 分配 + 加锁注册 + 缺页，应提供预热接口在启动阶段付掉。
 11. `SourceMeta` 的 static 可以写成 `static constexpr`，强制常量初始化、确保没有 guard。
 12. 头文件用了 `std::snprintf`/`gmtime_r` 但没有显式 `#include <cstdio>`/`<ctime>`（靠传递包含）。
+13. **Level 和 sink 应由 config 驱动**（需求修订后）：代码里 `MLOG_MIN_LEVEL` 把 level 和编译绑定，`addSink(std::make_unique<FileSink>(...))` 把输出目标写死在调用方。应改成：启动时读 config → `setLevel` → 按 sink 类型注册表装配 → `start`；`MLOG_MIN_LEVEL` 降级为可选优化（默认 `Trace`，即不裁剪）。宏的惰性求值价值不受影响——`enabled(lvl)` 为假时参数照样不求值。
+14. 空转用 `sleep_for(50µs)` 写死；应做成配置项（quill 的 `sleep_duration` 默认 500ns，0 = busy-spin），并支持 pin 核。
+15. 时间戳用 `system_clock::now()`（vDSO，~20ns）；进一步优化是热路径存裸 `rdtsc`、后台校准换算，见主页面 §9.1。
 
 ## 完整代码
 
