@@ -65,6 +65,67 @@ draft: false
 * Level 与 sink 列表来自 config，与 build type 无关；level 可热更新（atomic），sink 列表启动后只读
 ```
 
+### 1.1 这些问题，市面上的库是怎么回答的
+
+对照 quill / spdlog / NanoLog / fmtlog / glog。API 名字以 quill v4 为准，凭记忆写，版本间有改名，用前核对。
+
+**Q4 跨线程有序性**
+
+| 库 | 做法 |
+| --- | --- |
+| quill | 后台线程把各线程 ring 的记录读进 transit buffer，跨线程取时间戳最小的输出（k-way merge）；`log_timestamp_ordering_grace_period` 只处理早于 `now − grace` 的记录 —— 即 §7.1 的 watermark，quill 把它做成了默认行为 |
+| fmtlog | per-thread 队列 + `poll()` 按时间戳挑最小；没有 grace period，理论上有 §7.1 的乱序窗口 |
+| NanoLog | 运行时**不排序**；有序性推迟到**离线解码器**，解码时按时间戳 merge |
+| spdlog async | 一个共享 MPMC 队列 → 顺序 = 拿锁顺序，近似但不严格（时间戳在拿锁前取） |
+| glog | 同步 + sink 锁，严格全局有序，代价是热路径上的锁 |
+
+结论：per-thread 队列的库都只能"尽力"有序；认真的加 watermark，追求吞吐的推到离线。
+
+**Q5 参数类型范围**
+
+| 库 | 做法 |
+| --- | --- |
+| quill | 算术、enum、string 家族及其标准容器：原样拷进队列、后台 fmt 格式化。用户类型必须显式声明：`DeferredFormatCodec<T>`（拷对象、后台格式化）或 `DirectFormatCodec<T>`（**热路径上先格式化成字符串**）。未声明的非平凡类型 → **编译错误** |
+| fmtlog | 平凡可拷贝的直接拷；否则在调用点格式化成字符串 |
+| NanoLog | 只支持 printf 风格基本类型和 `%s`；用户类型自己拆。换来每个参数都是纯 `memcpy` |
+| binlog | 任意类型，但用户结构体要 `BINLOG_ADAPT_STRUCT` 声明字段 |
+| spdlog | 任何有 `fmt::formatter` 的类型，因为**用户参数在热路径上就格式化了**（只有 pattern 前缀在后台加）。最灵活，也最慢 |
+
+结论：类型自由度和热路径成本直接对换。quill 的 codec 是"默认高效、显式退化"，可当理想答案提。
+
+**Q6 字符串参数的生命周期**
+
+| 库 | 做法 |
+| --- | --- |
+| quill | `string` / `string_view` / `const char*` / `char[]` **全部深拷贝**（长度 + 内容），`const char*` 要 `strlen`；没有"只存指针"模式 |
+| fmtlog / NanoLog / binlog | 同样全部拷贝；NanoLog 的 `%s` 要求 null 结尾 |
+| spdlog / glog | 热路径上已格式化完，问题不存在 —— eager formatting 最大的简化 |
+
+结论：**没有主流库默认存指针**。本文的 `LOG_REF` 字面量优化是自研 logger 才做的事，面试里作为"可以做但库都没做，因为安全 > 几十纳秒"来提。
+
+**Q9 Level 控制**
+
+| 库 | 运行期 | 编译期 | 备注 |
+| --- | --- | --- | --- |
+| quill | **per-logger** `set_log_level()`，宏里第一件事是一次 relaxed load | `QUILL_COMPILE_ACTIVE_LOG_LEVEL_*` 可删掉低级别宏，**默认不删** | 另有 `LOG_*_LIMIT` 限流、`LOG_DYNAMIC` 运行期指定级别 |
+| spdlog | per-logger + **per-sink** `set_level()`；`cfg::load_env_levels()` 读 `SPDLOG_LEVEL` 环境变量，`load_argv_levels()` 读命令行 | `SPDLOG_ACTIVE_LEVEL` **默认 INFO**，`SPDLOG_DEBUG(...)` 宏默认被编译掉；`logger->debug()` 方法形式永远在 | "debug 日志怎么不出来"的经典坑 |
+| fmtlog | `setLogLevel()` 全局 | `FMTLOG_ACTIVE_LEVEL` | |
+| NanoLog | `setLogLevel()` 全局 | 无 | |
+| glog | `FLAGS_minloglevel`、`FLAGS_v`；gflags / 环境变量 | `DLOG` / `DCHECK` 在 `NDEBUG` 下消失 | 唯一真正**绑 build type** 的，但定位是"仅 debug build 的断言级诊断"，与运维 level 并存 |
+
+结论：所有库的主控制手段都是运行期，quill / spdlog 还是 per-logger；编译期开关一律是可选附加项（spdlog 默认砍到 INFO 被普遍认为是坑）。level 来自 config 和业界一致，spdlog 的 `load_env_levels` 就是最小实现。
+
+**Q10 崩溃时**
+
+| 库 | 做法 |
+| --- | --- |
+| quill | ① `Backend::start_with_signal_handler()`：handler 里只置标志，**后台线程**排空所有 ring、flush、再 re-raise（带超时）—— 没在 handler 里格式化，遵守 async-signal-safe。② `LOG_BACKTRACE` + `init_backtrace(n)`：每个 logger 一个环形缓冲存最近 n 条低级别日志，平时不输出，遇 ERROR 一起吐出（flight recorder） |
+| spdlog | 无信号处理；`flush_on(level)` + `flush_every(s)`；`enable_backtrace(n)` / `dump_backtrace()` 与 quill 同思路。async 模式崩溃时队列里的**就丢了** |
+| glog | `InstallFailureSignalHandler()` 打堆栈；同步写所以无待 flush 队列；`LOG(FATAL)` flush 后 abort |
+| NanoLog / fmtlog | 显式 `sync()` / `poll()`，无内置 crash handler；staging buffer 在进程内存，崩了就丢 |
+
+结论：库级标准答案 = **handler 置标志 → 后台线程 drain → re-raise** + **backtrace 环形缓冲**。§10 说的 mmap / 共享内存让外部进程消费，开源 C++ 库基本没有，是交易公司自研或 Java 圈（Chronicle）的做法 —— 面试里说出来是超出库水平的加分项。
+
 ### 为什么做市场景对 logging 特别敏感
 
 - 交易线程通常是 **busy-spin + pin 核 + 隔离核（isolcpus）** 的，一次 syscall 或一次锁等待造成的抖动，直接体现为 quote 更新变慢 → 被 pick off（adverse selection）。
